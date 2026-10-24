@@ -8,9 +8,9 @@
 
 | Task ID | Role | Title | Status | Gate Evidence |
 |---|---|---|---|---|
-| T00 | Orchestrator | PRD review, ADR-001, ADR-002, subagent definitions | DONE | ADRs & `.claude/agents/*.md` written |
+| T00 | Orchestrator | PRD review, ADR-001, ADR-002, subagent definitions | DONE | ADRs & `.agents/agents/*.md` written |
 | T00R | Git/Release | Repository kickoff & remote verification | DONE | Remote verified (`origin`), baseline prepared |
-| T01 | DevOps/Docs | Project scaffold, settings, CI workflow, tooling | IN PROGRESS | Next |
+| T01 | DevOps/Docs | Project scaffold, settings, CI workflow, tooling | DONE | Gates green: ruff, mypy, django check, pytest |
 | T02 | Data | CSV cleaning & dedupe | PENDING | Phase 2 |
 | T03 | Data | Offline geocoding & station loader | PENDING | Phase 2 |
 | T04 | Geo/Routing | Routing client & geocoder | PENDING | Phase 2 |

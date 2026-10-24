@@ -1,316 +1,343 @@
 # PRD: Fuel Route Planner API
 
-**Owner:** Mahidhar  |  **Status:** Draft v1.0  |  **Stack:** Django (latest stable), Python 3.12+  |  **Delivery window:** 3 days from receipt of the exercise
+**Owner:** Mahidhar  |  **Status:** Approved v2.0 (Antigravity Edition)  |  **Stack:** Django (latest stable), Python 3.12+, Django REST Framework  |  **Environment:** Antigravity 2.0 / Windows & Linux  |  **Delivery window:** 3 days from receipt
+
+---
 
 ## 1. Overview
 
-The Fuel Route Planner API accepts a start and a finish location inside the USA and returns:
+The **Fuel Route Planner API** accepts a start and a finish location within the United States and returns:
 
-1. The driving route, as a map-ready GeoJSON object and a viewable HTML map.
-2. An ordered list of recommended fuel stops along the route, chosen to minimise total fuel cost.
-3. The total money spent on fuel for the trip.
+1. The optimal driving route, formatted as map-ready GeoJSON and viewable in both a web-based Leaflet HTML map and an inline Antigravity Generative UI preview widget.
+2. An ordered list of recommended fuel stops along the route, selected algorithmically to minimize total fuel expenditure.
+3. The total money spent on fuel across the entire journey.
 
-The vehicle has a maximum range of 500 miles on a full tank and achieves 10 miles per gallon (so a full tank is 50 gallons). Fuel prices come from the supplied CSV file. The API must be fast and must make very few calls to the external map/routing service.
+The vehicle has a maximum range of **500 miles** on a full tank and achieves **10 miles per gallon (MPG)**, corresponding to a **50-gallon** fuel tank capacity. Fuel prices are sourced from the provided truckstop dataset. The system enforces strict external API call budgets, fast local computation, and clean architectural separation.
+
+---
 
 ## 2. Problem Statement
 
-A driver planning a long USA trip wants to know where to stop for fuel and what it will cost. Fuel prices vary by about $3.70 per gallon across the dataset, so stopping at the right stations saves real money. Choosing stops by hand across a multi-state route is impractical. The API automates this: route, optimal stops, and total cost in one request.
+Long-haul driving across the United States involves significant fuel price variance: across the supplied dataset, diesel prices vary by over \$3.70 per gallon between stations. For a 2,800-mile cross-country trip, stopping at optimal stations saves hundreds of dollars compared to random or unoptimized stops. Manually finding stations within reach and comparing prices along a multi-state route is intractable.
+
+This API automates the process: given origin and destination, it calculates the route, queries candidates within a geographic corridor, applies a greedy optimization algorithm, and outputs the cost-minimal fuel stop plan in a single request.
+
+---
 
 ## 3. Goals and Non-Goals
 
 ### Goals
-
-- G1. Return a route between any two USA locations.
-- G2. Select fuel stops that minimise total fuel cost while never exceeding the 500-mile range.
-- G3. Return total fuel cost, using 10 MPG.
-- G4. Return a map (GeoJSON plus a rendered HTML map) showing the route and stops.
-- G5. Respond quickly: local computation under 300 ms, and at most 1 routing call per request (3 including geocoding, as a worst case).
-- G6. Be production-shaped: validated input, clear errors, tests, README, reproducible setup.
+- **G1. Route Generation**: Calculate driving routes between any two valid USA locations.
+- **G2. Cost-Minimal Fuel Planning**: Select fuel stops that minimize overall cost while never exceeding the 500-mile vehicle range.
+- **G3. Accurate Fuel Arithmetic**: Compute total gallons consumed and total fuel cost using exact `Decimal` arithmetic at 10 MPG.
+- **G4. Dual-Surface Visualization**: Provide both an interactive Leaflet HTML map and an Antigravity Generative UI widget showing the route line, numbered stop markers, and fuel metrics.
+- **G5. High Performance & Call Budget**: Achieve local computation $< 300\text{ ms}$ (p95), cache-hit responses $< 50\text{ ms}$, and at most 1 external routing call per request (at most 3 if free-text geocoding is required; 0 on cache hits).
+- **G6. Production Engineering**: Strict typing (`mypy --strict`), comprehensive automated tests ($\ge 90\%$ coverage on core modules), property-based testing, and automated quality gates.
 
 ### Non-Goals
+- Real-time or live fuel price scraping (the dataset is an offline static snapshot).
+- Turn-by-turn navigation instructions.
+- Detour fuel penalties (stations within the 5-mile corridor are assumed accessible with negligible detour cost).
+- User authentication, billing, or saved trip profiles.
+- Routes outside the contiguous United States, EV charging networks, traffic forecasting, or toll calculations.
 
-- Real-time or live fuel prices (the CSV is a static snapshot).
-- Turn-by-turn navigation.
-- Detours: stations are assumed reachable from the route at negligible cost.
-- User accounts, authentication, billing, or saved trips.
-- Non-USA routes, EV charging, multiple vehicle profiles, traffic or tolls.
+---
 
 ## 4. Users and Use Cases
 
-| User | Use case |
+| User / Persona | Use Case |
 | --- | --- |
-| Driver or trip planner (via a client app) | Enter origin and destination and see the cheapest fuel plan on a map. |
-| Frontend or integrator developer | Call a JSON API and render the returned GeoJSON. |
-| Reviewer or evaluator | Run the project, hit the endpoint, check correctness, speed, and call count. |
+| **Driver or Fleet Planner** | Inputs origin and destination; receives the cheapest fuel stop schedule, gallons to buy at each stop, and visual route map. |
+| **Frontend / API Integrator** | Consumes JSON endpoints (`/api/v1/route/`) and renders GeoJSON features directly in client applications. |
+| **Antigravity Pair Programmer / Reviewer** | Inspects system behavior, verifies quality gates, interacts with map artifacts in Antigravity chat, and audits performance benchmarks. |
 
-## 5. Input Data: Findings from the Supplied CSV
+---
 
-The file `fuel-prices-for-be-assessment.csv` was inspected. These findings drive several requirements below.
+## 5. Input Data: Analysis of Supplied Dataset
 
-| Finding | Detail | Implication |
+Analysis of `fuel-prices-for-be-assessment.csv` (8,151 rows):
+
+| Property | Dataset Value | Engineering Implication |
 | --- | --- | --- |
-| Size | 8,151 rows, 7 columns: OPIS Truckstop ID, Truckstop Name, Address, City, State, Rack ID, Retail Price | Small enough to hold fully in memory. |
-| No coordinates | Addresses look like `I-44, EXIT 283 & US-69`. There is no latitude or longitude. | Stations must be geocoded offline before they can be matched to a route. |
-| Duplicate station IDs | 1,413 rows repeat an ID (678 distinct IDs affected). For 597 of those IDs, the repeated rows carry different prices. | Need a deterministic dedupe rule. |
-| Non-USA rows | State codes include Canadian provinces and territories (AB, BC, MB, NB, NS, ON, QC, SK, YT). | Filter these out. |
-| Price range | Retail price per gallon from about $2.69 to $6.40 (mean about $3.50). | Outliers near the top should be sanity-checked. |
-| Unique locations | About 6,434 distinct address, city, state combinations. | This is the geocoding workload. |
+| **Row Count** | 8,151 rows, 7 columns (`OPIS Truckstop ID`, `Truckstop Name`, `Address`, `City`, `State`, `Rack ID`, `Retail Price`) | Memory-friendly; suitable for preloading into an in-memory spatial index (KD-Tree). |
+| **Coordinates** | None (addresses formatted as highway exits, e.g., `I-44, EXIT 283 & US-69`) | Requires one-time offline geocoding before runtime matching. Zero runtime geocoding for stations. |
+| **Duplicate IDs** | 1,413 duplicate IDs (597 IDs have conflicting prices) | Deterministic deduplication rule: preserve the record with the lowest retail price. |
+| **Geographic Scope** | Includes non-US entries (Canadian provinces: AB, BC, MB, NB, NS, ON, QC, SK, YT) | Filtered out during CSV ingestion; only US stations are stored. |
+| **Price Distribution** | Retail prices span \$2.69 to \$6.40 (mean ~\$3.50) | Validated with boundary assertions; parsed strictly into `Decimal`. |
+| **Unique Locations** | ~6,434 unique (Address, City, State) tuples | Batch geocoded offline via US Census Geocoder + city centroid fallbacks. |
 
-## 6. Assumptions
+---
 
-These are explicit so the behaviour is predictable and reviewable. Items marked **(confirm)** should be confirmed with the exercise author if possible; otherwise the stated default is used and documented in the README.
+## 6. Default Assumptions
 
-- A1. Vehicle starts with a **full tank (500 miles of range)**. Only fuel purchased en route is charged. **(confirm)**
-- A2. The vehicle may arrive with a small reserve; the planner buys only what is needed to reach the destination at the final stop.
-- A3. Price is per gallon at the listed station; the vehicle can buy any fractional quantity up to tank capacity (50 gallons).
-- A4. A station is a valid candidate if it lies within a corridor of **5 miles** of the route (configurable). Detour distance and fuel are ignored.
-- A5. Fuel consumption is a constant 10 MPG regardless of terrain, speed, or load.
-- A6. For duplicate station IDs, the **lowest price** is kept. This is the cost-optimal reading of the data. **(confirm)**
-- A7. Distances are driving distances along the route returned by the routing provider, in miles.
-- A8. An optional safety reserve (default 0 miles) can be configured so the planner never plans to run the tank to zero.
+- **A1. Starting Fuel**: Vehicle departs origin with a **full tank (500 miles of range / 50 gallons)**. Only fuel purchased en route is charged to the trip cost.
+- **A2. Final Arrival**: The planner buys only the exact quantity of fuel needed to reach the destination with zero waste.
+- **A3. Fractional Fuel Purchases**: Stations permit continuous/fractional purchases up to tank capacity (50 gallons).
+- **A4. Route Corridor**: A station is an eligible candidate if it lies within a **5-mile radius** of the route polyline.
+- **A5. Constant Consumption**: Fuel economy is exactly 10 MPG regardless of terrain, payload, or speed.
+- **A6. Duplicate Station Prices**: For repeated station IDs, the lowest price is preserved.
+- **A7. Distance Metric**: Distances represent cumulative driving road miles along the routing provider's polyline.
+- **A8. Safety Reserve**: Configurable reserve (default 0 miles; vehicle may run down to 0 at a planned stop).
+
+---
 
 ## 7. Functional Requirements
 
-### 7.1 Input handling
+### 7.1 Input Handling & Validation
+- **FR1**: Accept `start` and `finish` as either free-text queries (e.g., `"Austin, TX"`) or explicit `{ "lat": float, "lon": float }` objects.
+- **FR2**: Validate that coordinates and geocoded locations reside within the USA. Return HTTP 422 if outside the USA.
+- **FR3**: Reject missing, empty, or identical start/finish inputs with HTTP 400.
 
-- FR1. Accept `start` and `finish` as free-text locations (for example "Dallas, TX") **or** as `{lat, lon}` objects. Coordinates skip the geocoding call.
-- FR2. Validate that both points resolve to locations inside the USA; otherwise return a 422 error.
-- FR3. Reject missing, empty, or identical start and finish with a 400 error.
+### 7.2 Routing & Geocoding
+- **FR4**: Request route polyline and distance using **exactly one call** to a routing provider (primary: OpenRouteService; fallback: OSRM).
+- **FR5**: Free-text geocoding uses at most two provider calls (one for start, one for finish). Total external calls must never exceed 3 (1 with coordinates; 0 on cache hits).
 
-### 7.2 Routing
+### 7.3 Station Corridor Matching
+- **FR6**: Station spatial matching executes **entirely locally** using the pre-computed `cKDTree` spatial index. No external calls permitted for station discovery.
+- **FR7**: Identify all candidate stations within the 5-mile corridor and project each station onto the polyline to determine its **mile marker** (distance from route start).
 
-- FR4. Obtain the route with **one call** to a free routing API (primary: OpenRouteService; fallback: OSRM). The response supplies the full route geometry and total distance.
-- FR5. Geocoding of free-text inputs may use the same provider (up to two additional calls). Total external calls per request must not exceed 3, and exactly 1 when coordinates are supplied or results are cached.
+### 7.4 Optimal Fuel Stop Selection
+- **FR8**: Solve the fuel planning problem using a greedy strategy:
+  - If a station with a lower price exists within reachable range, buy only enough fuel to reach that station.
+  - If no cheaper station exists within reachable range, fill the tank to capacity (or enough to reach the destination if reachable), then advance to the cheapest available station within the expanded range.
+- **FR9**: If the total route distance is $\le 500\text{ miles}$, return 0 fuel stops and \$0.00 fuel cost.
+- **FR10**: If an unbridgeable station gap $> 500\text{ miles}$ occurs, raise `InfeasibleRouteError` and return HTTP 422 with the exact mile range of the gap.
 
-### 7.3 Station matching
+### 7.5 Output & Visualization
+- **FR11**: Response payload includes trip summary (total distance, gallons consumed, total fuel cost), an ordered stop list (name, address, city, state, coordinates, price per gallon, mile marker, gallons purchased, stop cost), and GeoJSON.
+- **FR12**: Provide a dedicated HTML map view (`GET /api/v1/map/<request_id>/`) using Leaflet and OpenStreetMap tiles.
+- **FR13**: Support inline Antigravity Generative UI visualization artifacts for interactive developer inspection inside the Antigravity chat.
 
-- FR6. All station lookups run **locally** against preloaded, geocoded data. No external call is made to find stations.
-- FR7. Find all stations within the corridor of the route and compute each station's **mile marker** (distance along the route at its nearest point).
-
-### 7.4 Fuel stop optimisation
-
-- FR8. Select the set of stops and purchase quantities that minimise total cost subject to: range of 500 miles, tank capacity of 50 gallons, and ending at the destination.
-- FR9. If the whole trip is within range of the starting tank, return zero stops and a cost of $0, noting this in the response.
-- FR10. If no feasible plan exists (a gap larger than 500 miles with no station), return a clear 422 error that states the offending mile range.
-
-### 7.5 Output
-
-- FR11. Return total distance, total gallons consumed, total fuel cost, and the list of stops (name, address, city, state, coordinates, price per gallon, mile marker, gallons purchased, cost).
-- FR12. Return the route and stops as a GeoJSON FeatureCollection.
-- FR13. Provide an HTML map view (Leaflet with OpenStreetMap tiles) showing the route line and numbered stop markers with popups.
+---
 
 ## 8. API Specification
 
-### 8.1 Plan a trip
-
+### 8.1 Plan Route Endpoint
 `POST /api/v1/route/`
 
-**Request**
-
+**Request Payload Examples:**
 ```json
 {
   "start": "Los Angeles, CA",
   "finish": "New York, NY"
 }
 ```
-
-Alternatively `{ "start": {"lat": 34.05, "lon": -118.24}, "finish": {"lat": 40.71, "lon": -74.00} }`.
-
-**Response 200**
-
+*Or using coordinate objects:*
 ```json
 {
-  "request_id": "c7f1...",
-  "start": {"query": "Los Angeles, CA", "lat": 34.05, "lon": -118.24},
-  "finish": {"query": "New York, NY", "lat": 40.71, "lon": -74.00},
+  "start": { "lat": 34.0522, "lon": -118.2437 },
+  "finish": { "lat": 40.7128, "lon": -74.0060 }
+}
+```
+
+**Response Payload (HTTP 200 OK):**
+```json
+{
+  "request_id": "c7f1a8e0-4b21-4d33-9f8a-9812b1234567",
+  "start": { "query": "Los Angeles, CA", "lat": 34.0522, "lon": -118.2437 },
+  "finish": { "query": "New York, NY", "lat": 40.7128, "lon": -74.0060 },
   "distance_miles": 2790.4,
-  "gallons_consumed": 279.0,
-  "total_fuel_cost": 905.12,
+  "gallons_consumed": 279.04,
+  "total_fuel_cost": 894.35,
   "currency": "USD",
   "stops": [
     {
       "order": 1,
-      "name": "EXAMPLE TRAVEL CENTER",
+      "name": "PILOT TRAVEL CENTER #123",
       "address": "I-40, EXIT 123",
-      "city": "Example",
+      "city": "Flagstaff",
       "state": "AZ",
-      "lat": 35.1,
-      "lon": -111.6,
-      "mile_marker": 410.2,
-      "price_per_gallon": 3.05,
-      "gallons_purchased": 41.0,
-      "cost": 125.05
+      "lat": 35.1983,
+      "lon": -111.6513,
+      "mile_marker": 462.1,
+      "price_per_gallon": 3.09,
+      "gallons_purchased": 46.21,
+      "cost": 142.79
     }
   ],
-  "route_geojson": { "type": "FeatureCollection", "features": [] },
-  "map_url": "/api/v1/map/c7f1.../",
+  "route_geojson": {
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "geometry": {
+          "type": "LineString",
+          "coordinates": [[-118.2437, 34.0522], [-111.6513, 35.1983], [-74.0060, 40.7128]]
+        },
+        "properties": { "name": "Driving Route" }
+      }
+    ]
+  },
+  "map_url": "/api/v1/map/c7f1a8e0-4b21-4d33-9f8a-9812b1234567/",
   "meta": {
     "external_api_calls": 1,
     "cache_hit": false,
-    "compute_ms": 84
+    "compute_ms": 112
   }
 }
 ```
 
-Values above are illustrative only.
+### 8.2 Interactive Map Endpoint
+`GET /api/v1/map/<request_id>/`
+Renders a responsive Leaflet.js HTML page displaying the route polyline, origin/destination markers, and numbered fuel stop pins with interactive popups showing price, gallons purchased, and stop cost.
 
-### 8.2 View the map
+### 8.3 Health Check Endpoint
+`GET /api/v1/health/`
+Returns `{"status": "healthy", "stations_loaded": 8151, "spatial_index_ready": true}`.
 
-`GET /api/v1/map/<request_id>/` returns an HTML page rendering the stored result. The result is held in cache for a configurable time (default 24 hours).
+### 8.4 Error Handling
+All error responses adhere to the uniform envelope:
+```json
+{
+  "error": {
+    "code": "LOCATION_OUTSIDE_USA",
+    "message": "Start location resolved outside contiguous United States."
+  }
+}
+```
 
-### 8.3 Health
+| HTTP Status | Error Code | Trigger Condition |
+| --- | --- | --- |
+| **400 Bad Request** | `INVALID_INPUT` | Missing required parameters, invalid format, or identical start/finish |
+| **422 Unprocessable** | `LOCATION_NOT_FOUND` | Free-text location could not be geocoded |
+| **422 Unprocessable** | `OUTSIDE_USA` | Coordinates resolve outside the USA |
+| **422 Unprocessable** | `INFEASIBLE_ROUTE` | Unbridgeable gap $> 500\text{ miles}$ without an available station |
+| **429 Too Many Req** | `RATE_LIMITED` | DRF client throttling limit exceeded or provider rate limit encountered |
+| **502 Bad Gateway** | `PROVIDER_ERROR` | Upstream routing/geocoding service unreachable or timed out |
 
-`GET /api/v1/health/` returns service status and the number of stations loaded.
+---
 
-### 8.4 Errors
+## 9. Algorithmic Design: Fuel Stop Optimization
 
-| Status | Condition |
-| --- | --- |
-| 400 | Missing or malformed input, identical start and finish |
-| 422 | Location not found or outside the USA; no feasible fuel plan (gap over 500 miles) |
-| 502 | Routing or geocoding provider failed or timed out |
-| 429 | Provider rate limit reached |
+### 9.1 Formulation
+Let the route be discretized into points with cumulative distances $d_0 = 0$ (origin) up to $d_{final} = D$ (destination). Stations $S = \{s_1, s_2, \dots, s_n\}$ along the corridor are ordered by mile marker $m_i \in [0, D]$, with unit fuel price $p_i$. The vehicle has fuel capacity $C = 50\text{ gal}$, fuel efficiency $\eta = 10\text{ MPG}$, and starting fuel range $R_0 = 500\text{ miles}$.
 
-All errors use the shape `{"error": {"code": "...", "message": "..."}}`.
+### 9.2 Greedy Execution
+1. Sort candidate corridor stations strictly by increasing mile marker.
+2. Initialize current location at mile 0 with full tank range (500 miles).
+3. While current position $< D$:
+   - Scan all reachable stations within current range.
+   - **Case A (Cheaper station reachable)**: Find the nearest reachable station $s_{cheap}$ where $p_{cheap} < p_{curr}$. Purchase only enough fuel to reach $s_{cheap}$, and advance to $s_{cheap}$.
+   - **Case B (Current station is cheapest in range)**:
+     - If destination $D$ is within range, buy only fuel to reach $D$ and terminate.
+     - Otherwise, purchase fuel to fill the tank to maximum capacity (500 miles of range). Advance to the station within range that offers the lowest fuel price.
+4. If at any step no stations are reachable and the destination is not reachable, raise `InfeasibleRouteError(gap_start, gap_end)`.
 
-## 9. Core Algorithm: Fuel Stop Selection
+### 9.3 Optimality & Verification
+The greedy choice property guarantees optimal total cost for this problem structure. The implementation is verified through **property-based tests** cross-checking greedy results against an exhaustive dynamic programming reference across 500+ randomized station topologies.
 
-This is the classic gas station problem, solved greedily on the stations found along the route.
+---
 
-1. Build the candidate list: stations in the corridor, sorted by mile marker. Add the start (mile 0, with the initial tank) and the destination (mile D) as virtual nodes.
-2. At the current position, with current fuel in range terms, look at all stations reachable within a full tank (500 miles) ahead.
-3. **If a cheaper station exists within range:** buy only enough fuel to reach the nearest such cheaper station, and drive there.
-4. **If no cheaper station exists within range:** fill the tank to capacity at the current station (if the destination is not reachable otherwise), then drive to the cheapest station within the new range. If the destination is within range, buy only the fuel needed to arrive.
-5. Repeat until the destination is reached.
-6. Total cost is the sum over stops of gallons purchased multiplied by the price at that stop. Gallons purchased equal miles to cover divided by 10.
+## 10. System Design & Antigravity Architecture
 
-Why greedy works here: with a fixed tank capacity and no detour cost, buying just enough to reach a cheaper station and filling up fully only when the current station is the cheapest in range is provably optimal. The implementation is covered by tests that cross-check it against a brute-force dynamic program on small randomised cases.
-
-Complexity is O(n log n) for sorting plus O(n) for the scan, where n is the number of corridor stations (typically a few hundred).
-
-## 10. System Design
+```
+                  +----------------------------------------------+
+                  |         Antigravity Lead Orchestrator        |
+                  |  - Planning, ADRs, Gates, Artifacts, Reports  |
+                  +----------------------------------------------+
+                                         |
+         +-------------------------------+-------------------------------+
+         |                               |                               |
++------------------+           +-------------------+           +-------------------+
+|  Data Engineer   |           | Geo/Routing Eng.  |           |   Algorithm Eng.  |
+| - CSV dedupe     |           | - ORS/OSRM client |           | - Greedy optimizer|
+| - Offline geocode|           | - Polyline densify|           | - Decimal maths   |
+| - Station loader |           | - KD-Tree index   |           | - Property tests  |
++------------------+           +-------------------+           +-------------------+
+         |                               |                               |
+         +-------------------------------+-------------------------------+
+                                         |
+         +-------------------------------+-------------------------------+
+         |                                                               |
++------------------+                                           +-------------------+
+|   API Engineer   |                                           |   Map Engineer    |
+| - DRF endpoints  |                                           | - Leaflet HTML    |
+| - Throttling     |                                           | - GeoJSON builder |
+| - Error envelope |                                           | - Generative UI   |
++------------------+                                           +-------------------+
+```
 
 ### 10.1 Components
+- **Data Pipeline**: Clean, filter, and geocode the raw CSV once offline using the US Census Bureau batch API with city centroid fallback. Store processed data in `data/processed/stations_geocoded.json` and load via `python manage.py load_stations`.
+- **Spatial Index**: `cKDTree` built from station coordinates at application startup. Enables sub-millisecond 5-mile corridor queries.
+- **Routing Engine**: `RoutingClient` protocol with OpenRouteService primary and OSRM fallback. Strictly 1 routing call per uncached request.
+- **Optimizer Engine**: Pure Python module (`planner/optimizer.py`) with zero Django or database dependencies.
+- **Presentation Layer**: Django REST Framework API views, Leaflet map views, and Antigravity Generative UI widgets.
 
-| Component | Responsibility |
-| --- | --- |
-| Data prep command (`manage.py load_stations`) | One-time: clean CSV, dedupe, drop non-USA, geocode, store in the database. |
-| `Station` model | id, name, address, city, state, lat, lon, price, geocode\_quality. |
-| Station index | In-memory numpy arrays plus a `cKDTree` built at startup for fast spatial queries. |
-| Routing client | Wraps the routing provider; timeouts, retries, error mapping. |
-| Geocoding client | Free-text to coordinates, with caching. |
-| Planner service | Corridor search, mile-marker computation, stop selection, cost calculation. |
-| API layer | Django REST Framework views and serializers for validation. |
-| Map renderer | Builds GeoJSON and the Leaflet HTML page. |
-| Cache | Redis for geocodes, routes, and results. |
+---
 
-### 10.2 Request flow
+## 11. Non-Functional Requirements & Performance Budgets
 
-1. Validate input.
-2. Look up the cache for the (start, finish) pair. On a hit, skip to step 6.
-3. Geocode free-text inputs if needed (0 to 2 calls, each cached).
-4. Call the routing API once and obtain the geometry and distance.
-5. Run the planner locally: corridor query, mile markers, stop selection, cost.
-6. Build the response and GeoJSON, store the result under a `request_id`, and return it.
-
-### 10.3 Offline station geocoding
-
-Stations have no coordinates, so geocoding is a one-time batch job and never happens during a request.
-
-- **Primary:** US Census Geocoder batch endpoint (free; a batch accepts up to 10,000 records, enough for the roughly 6,400 unique addresses).
-- **Fallback:** city and state centroid from a free USA places dataset, for addresses that do not resolve (highway exit descriptions often will not).
-- Each station stores a `geocode_quality` flag (`address` or `city_centroid`) so the accuracy is transparent.
-- Because the corridor is 5 miles wide and city centroids can be off by a few miles, the README documents this tradeoff.
-
-### 10.4 Spatial matching
-
-- Densify the route polyline to a point roughly every 1 to 2 miles and compute cumulative distance along it.
-- Query the KD-tree (on projected or scaled coordinates) with the corridor radius to find candidate stations.
-- Assign each candidate to its nearest route point to obtain its mile marker.
-- A bounding-box prefilter avoids testing stations far from the route.
-
-### 10.5 External API budget
-
-| Scenario | Geocode calls | Route calls | Total |
-| --- | --- | --- | --- |
-| Coordinates supplied | 0 | 1 | 1 |
-| Free-text, cold cache | 2 | 1 | 3 |
-| Repeated request (cache hit) | 0 | 0 | 0 |
-
-The provider choice (OpenRouteService with a free key, OSRM demo as a fallback) should be confirmed against current free-tier limits at build time.
-
-## 11. Non-Functional Requirements
-
-| Area | Requirement |
-| --- | --- |
-| Performance | Local compute (excluding external calls) under 300 ms at p95; cache-hit responses under 50 ms; total response under 2 s at p95 on a cold request. |
-| External calls | At most 3 per request; 1 when coordinates are given. |
-| Reliability | Provider timeouts of 5 s with one retry; clean 502 on failure. |
-| Correctness | Never plan a leg longer than 500 miles; cost arithmetic uses `Decimal` and rounds to cents at output. |
-| Security | API keys read from environment variables, never committed; input validation; sensible DRF throttling. |
-| Observability | Structured logging with `request_id`, call counts, and timings. |
-| Portability | Runs with `pip install -r requirements.txt`, SQLite by default; optional Docker. |
-
-## 12. Testing and Acceptance
-
-### Test plan
-
-- **Unit:** stop-selection algorithm (edge cases: trip under 500 miles, single stop, cheaper station just beyond range, gap over 500 miles, all stations equal price); mile-marker computation; cost arithmetic; CSV cleaning and dedupe.
-- **Property check:** greedy planner compared against a brute-force optimiser on small random instances.
-- **Integration:** endpoint tests with the routing client mocked (fixtures for a short, a medium, and a coast-to-coast route), asserting external call counts.
-- **Manual:** one real run for each of several city pairs, verifying the map renders and stops sit near the route.
-
-### Acceptance criteria
-
-1. `POST /api/v1/route/` with a valid USA start and finish returns 200 with stops, total cost, and GeoJSON.
-2. No leg between consecutive stops (or start and first stop, or last stop and finish) exceeds 500 miles.
-3. Total cost equals the sum of per-stop costs, and total gallons purchased match the distance covered beyond the starting tank, at 10 MPG.
-4. Coordinates-in requests make exactly 1 external call; free-text requests make at most 3; repeat requests make 0.
-5. Non-USA or unresolvable locations return a clear 4xx error.
-6. The HTML map shows the full route and numbered stop markers.
-7. All tests pass, and the README lets a new reader run the project in under 10 minutes.
-
-## 13. Delivery Plan (3 Days)
-
-| Day | Scope | Exit criteria |
+| Requirement | Metric Target | Verification Strategy |
 | --- | --- | --- |
-| 1 | Project scaffold, CSV cleaning and dedupe, offline geocoding command, `Station` model and loader, KD-tree index. | Database loaded with geocoded US stations; quality stats reported. |
-| 2 | Routing client, corridor search, mile markers, stop-selection algorithm, cost calculation, unit tests. | Planner returns correct stops and cost on fixture routes. |
-| 3 | API endpoint and validation, GeoJSON and Leaflet map, caching, error handling, integration tests, README, demo recording. | Acceptance criteria 1 to 7 met; package ready to send. |
+| **Compute Latency** | Local compute $< 300\text{ ms}$ (p95) | Benchmarked across short, medium, and coast-to-coast routes in `tests/perf/` |
+| **Cache-Hit Latency** | Response time $< 50\text{ ms}$ (p95) | Cached request integration tests |
+| **Cold Request Latency** | Total response $< 2.0\text{ s}$ (p95) | End-to-end integration test with mocked provider network latency |
+| **External Call Budget** | Exactly 1 for coordinates; $\le 3$ for text; 0 on cache hits | Monitored with strict call-counter assertions in tests |
+| **Numeric Precision** | Zero float rounding errors | `Decimal` used exclusively for money, gallons, and unit prices |
+| **Code Quality** | $\ge 90\%$ test coverage on core; `mypy --strict`; clean `ruff` | CI pipeline and Antigravity per-task quality gates |
+
+---
+
+## 12. Testing and Verification Strategy
+
+1. **Unit Testing**:
+   - Algorithmic edge cases: trip $< 500$ miles, single stop, cheaper station just outside range, equal prices, reserve miles, and unbridgeable gaps.
+   - Polyline densification and KD-tree corridor spatial queries.
+   - CSV deduplication, Canadian province filtering, and price boundary validation.
+2. **Property-Based Testing**:
+   - Compare greedy optimizer outputs against brute-force DP on $\ge 500$ randomized test cases.
+3. **Mocked Integration Testing**:
+   - Test endpoints with recorded fixtures for coast-to-coast (LA to NYC), regional (Dallas to Atlanta), and short (Philadelphia to NYC) trips. Assert exact external call counts.
+4. **Antigravity Interactive Testing**:
+   - Validate map rendering and stop placement via Antigravity Generative UI artifacts.
+
+---
+
+## 13. Phased 3-Day Delivery Plan
+
+- **Day 1**: Scaffold Django project, implement CSV cleaning and offline geocoding command, load station database, build spatial index, implement pure greedy optimizer and property test suite.
+- **Day 2**: Implement routing and geocoding clients with caching, connect corridor query to optimizer, implement DRF endpoints (`/api/v1/route/`, `/api/v1/health/`), and add Leaflet map template.
+- **Day 3**: Complete integration tests with call-count assertions, profile performance against budgets, run security audits, author documentation (`README.md`, `PERF.md`, `STATUS.md`), and publish release tag `v1.0.0`.
+
+---
 
 ## 14. Deliverables
 
-- Django project source in a repository.
-- `requirements.txt`, `.env.example`, and optional Dockerfile.
-- README: setup, data preparation, API usage, assumptions, and known limitations.
-- Example requests and responses (curl or a Postman collection).
-- Test suite.
-- Short demo video or screenshots of the map.
+1. Full Django source code repository matching the layout in `AGENTS.md`.
+2. Cleaned and geocoded station dataset in `data/processed/`.
+3. Comprehensive test suite achieving $\ge 90\%$ coverage on `planner/` and `routing/`.
+4. Production configuration (`requirements.txt`, `.env.example`, `Dockerfile`, GitHub Actions CI).
+5. Comprehensive `README.md` with setup guide, API examples, curl snippets, and architectural decisions.
+6. Antigravity Artifacts: status logs, performance benchmarks, and interactive map preview.
+
+---
 
 ## 15. Risks and Mitigations
 
-| Risk | Likelihood | Impact | Mitigation |
-| --- | --- | --- | --- |
-| Poor geocoding quality for highway-exit addresses | High | Medium | Batch geocoder first, city-centroid fallback, `geocode_quality` flag, document the tradeoff. |
-| Free routing API rate limits or downtime | Medium | High | Cache aggressively, support OSRM fallback, accept coordinates directly. |
-| Geocoding job takes longer than planned | Medium | High | Start Day 1 with it; the city-centroid fallback guarantees full coverage quickly. |
-| Sparse stations leave a gap over 500 miles on some routes | Low | Medium | Clear 422 error naming the gap; widen the corridor on retry as an option. |
-| Ambiguous starting-fuel assumption | Medium | Medium | Document the default; make it a single configuration flag. |
-| Ambiguous duplicate pricing | Medium | Low | Keep lowest price, document it, keep the rule isolated in the loader. |
-| Corridor ignores real detour cost | High | Low | State the limitation; optional future work to include detour distance. |
+| Risk | Impact | Mitigation |
+| --- | --- | --- |
+| Highway exit addresses fail exact geocoding | Medium | Census batch geocoder primary + city centroid fallback; transparent `geocode_quality` flag. |
+| External routing provider rate limits | High | Aggressive in-memory/Redis caching; fallback OSRM support; coordinate inputs bypass geocoding. |
+| Large route corridors slow spatial matching | Medium | Polyline densification at 1-mile steps + bounding box prefilter + `cKDTree` radial query. |
+| Float precision drift in financial calculations | High | Mandatory `Decimal` throughout planner and API layers; rounded only at final serialization. |
 
-## 16. Open Questions
+---
 
-1. Should the starting tank be assumed full and free, or should the first fill-up be costed? (Default: full, not charged.)
-2. For duplicate station IDs with different prices, is the lowest price the intended choice, or the most recent? The file has no timestamp.
-3. Is there a preferred free routing provider, or is the choice left entirely to the implementer?
-4. Is a rendered map page required, or is GeoJSON sufficient? (Default: provide both.)
-5. Is a maximum acceptable detour from the route expected? (Default: 5-mile corridor, detour cost ignored.)
+## 16. Confirmed Design Decisions
 
-## 17. additional Enhancements you can try
+1. **Starting Fuel**: Full tank (500 miles of range) provided free at start of journey.
+2. **Duplicate Station Pricing**: Preserves the lowest price found among duplicate station IDs.
+3. **Routing Provider**: OpenRouteService as primary provider, with OSRM demo as resilient fallback.
+4. **Map Presentation**: Both REST API GeoJSON and rendered Leaflet HTML page provided.
+5. **Corridor Radius**: 5 miles standard corridor width.
 
-- Include detour distance and time in the stop cost.
-- Support multiple vehicle profiles (range, MPG, tank size).
-- Station-level amenities and brand filters.
-- Price freshness handling and scheduled data refresh.
-- Precomputed route graph for offline routing with zero external calls.
+---
+
+## 17. Additional Enhancements
+
+- Detour road distance and time penalties incorporated into stop cost function.
+- Multi-vehicle fleet profiles (configurable tank capacity, fuel efficiency, and fuel types).
+- Station amenity filtering (truck parking, showers, weigh stations).
+- Live fuel price sync hooks via periodic background tasks.
+- Precomputed offline road graph for zero-external-call routing.
