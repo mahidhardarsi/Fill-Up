@@ -1,0 +1,13 @@
+# Global fallback owner
+* @mahidhardarsi
+
+# Package-specific ownership
+/stations/ @mahidhardarsi
+/routing/ @mahidhardarsi
+/planner/ @mahidhardarsi
+/api/ @mahidhardarsi
+/maps/ @mahidhardarsi
+/config/ @mahidhardarsi
+/tests/ @mahidhardarsi
+/docs/ @mahidhardarsi
+
